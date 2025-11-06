@@ -1,0 +1,63 @@
+# Emporio - LLM Stock Trading Simulator Configuration
+# This is a TEMPLATE file. Copy this to config.yaml and add your API keys.
+
+# Trading Configuration
+trading:
+  initial_capital: 10000 # Starting capital in INR
+  stock_symbol: "IRCTC.NS" # IRCTC stock symbol for NSE (Yahoo Finance format)
+  commission_percentage: 0.0 # Trading commission (0.0 = no fees, 0.1 = 0.1% per trade)
+  allow_fractional_shares: false # Must be false for whole shares only
+
+# Simulation Configuration
+simulation:
+  historical_period_days: 365 # Last 1 year of data
+  start_date: null # Auto-calculated as (today - historical_period_days), or set specific date: "2024-01-01"
+  end_date: null # Auto-calculated as today, or set specific date: "2024-12-31"
+  data_interval: "1d" # Data granularity: 1m, 5m, 15m, 30m, 1h, 1d (Use 1d for reliable data)
+  simulation_speed: 10.0 # 1.0 = real-time, 2.0 = 2x speed, 0.5 = half speed, 10.0 = 10x speed
+  max_lookback_period: "30d" # Maximum historical data LLM can see (adjust based on interval)
+
+# LLM Configuration
+llm:
+  provider: "gemini" # gemini
+  model_name: "gemini-2.5-flash" # Gemini 2.5 Flash
+  api_key: "YOUR_GEMINI_API_KEY_HERE"  # Get from: https://makersuite.google.com/app/apikey
+  temperature: 0.7 # Creativity level (0.0 = deterministic, 1.0 = creative)
+  max_tokens: 2048 # Maximum response length
+  decision_frequency: "autonomous" # LLM decides when to trade based on confidence
+  min_confidence_threshold: 0.6 # Minimum confidence to execute a trade (0.0 to 1.0)
+
+# Tools Configuration
+tools:
+  news_search:
+    enabled: true # Toggle news search feature
+    provider: "newsapi" # newsapi or manual fallback
+    api_key: "YOUR_NEWSAPI_KEY_HERE" # Optional - Get from: https://newsapi.org/register
+    max_articles: 5 # Maximum news articles to fetch per query
+    search_keywords:
+      - "IRCTC"
+      - "Indian Railways"
+      - "railway stocks"
+      - "railway booking"
+
+# Memory Bank Configuration
+memory:
+  storage_type: "json" # json storage
+  file_path: "data/memory_bank.json" # Path to memory bank file
+  max_entries: 1000 # Maximum memory entries before archiving old ones
+  auto_save: true # Auto-save after each decision
+
+# UI Configuration
+ui:
+  title: "Emporio - LLM Stock Trading Simulator"
+  theme: "dark" # dark or light
+  refresh_interval: 5 # UI refresh interval in seconds
+  chart_height: 400 # Chart height in pixels
+  show_llm_reasoning: true # Display LLM's reasoning in UI
+
+# Logging Configuration
+logging:
+  level: "INFO" # DEBUG, INFO, WARNING, ERROR
+  log_to_file: true
+  log_file_path: "logs/trading.log"
+  log_format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
