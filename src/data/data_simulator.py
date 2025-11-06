@@ -21,15 +21,19 @@ class DataSimulator:
         self,
         historical_data: pd.DataFrame,
         speed_multiplier: float = 1.0,
-        max_lookback: str = "5d"
+        max_lookback: str = "5d",
+        tick_mode: bool = True,
+        tick_interval: float = 2.0
     ):
         """
         Initialize DataSimulator
         
         Args:
             historical_data: DataFrame with historical OHLCV data
-            speed_multiplier: Simulation speed (1.0 = real-time, 2.0 = 2x, etc.)
+            speed_multiplier: Simulation speed (1.0 = real-time, 2.0 = 2x, etc.) - used in time-based mode
             max_lookback: Maximum historical data LLM can access (e.g., "5d", "2h", "30m")
+            tick_mode: If True, advances one data point per tick_interval (better for daily data)
+            tick_interval: Seconds between ticks in tick mode (e.g., 2.0 = new data every 2 seconds)
         """
         self.historical_data = historical_data.copy()
         self.historical_data.sort_values('Datetime', inplace=True)
@@ -37,6 +41,8 @@ class DataSimulator:
         
         self.speed_multiplier = speed_multiplier
         self.max_lookback = self._parse_lookback(max_lookback)
+        self.tick_mode = tick_mode
+        self.tick_interval = tick_interval
         
         # Simulation state
         self.current_index = 0
@@ -44,13 +50,15 @@ class DataSimulator:
         self.real_start_time = None
         self.is_running = False
         self.is_paused = False
+        self.last_tick_time = None
         
         # Callbacks
         self.on_new_data_callbacks = []
         
+        mode_desc = f"tick mode ({tick_interval}s per point)" if tick_mode else f"time-based mode (speed {speed_multiplier}x)"
         logger.info(
             f"DataSimulator initialized with {len(self.historical_data)} data points, "
-            f"speed: {speed_multiplier}x, max lookback: {max_lookback}"
+            f"{mode_desc}, max lookback: {max_lookback}"
         )
     
     def _parse_lookback(self, lookback_str: str) -> timedelta:
@@ -77,9 +85,11 @@ class DataSimulator:
         self.is_paused = False
         self.simulation_start_time = self.historical_data['Datetime'].iloc[0]
         self.real_start_time = datetime.now()
+        self.last_tick_time = datetime.now()
         self.current_index = 0
         
-        logger.info(f"Simulation started at {self.simulation_start_time}")
+        mode_desc = f"tick mode ({self.tick_interval}s intervals)" if self.tick_mode else f"{self.speed_multiplier}x speed"
+        logger.info(f"Simulation started at {self.simulation_start_time} in {mode_desc}")
         
         # Start simulation thread
         self.simulation_thread = threading.Thread(target=self._run_simulation, daemon=True)
@@ -87,32 +97,62 @@ class DataSimulator:
     
     def _run_simulation(self):
         """Main simulation loop (runs in background thread)"""
-        while self.is_running and self.current_index < len(self.historical_data):
-            if self.is_paused:
-                time.sleep(0.1)
-                continue
-            
-            # Calculate current simulation time based on elapsed real time
-            real_elapsed = (datetime.now() - self.real_start_time).total_seconds()
-            sim_elapsed_seconds = real_elapsed * self.speed_multiplier
-            current_sim_time = self.simulation_start_time + timedelta(seconds=sim_elapsed_seconds)
-            
-            # Find the latest data point that should be available
-            next_data_time = self.historical_data['Datetime'].iloc[self.current_index]
-            
-            if current_sim_time >= next_data_time:
-                # New data point is available
-                new_data = self.historical_data.iloc[self.current_index].to_dict()
-                self._notify_new_data(new_data)
-                self.current_index += 1
-            else:
-                # Wait until next data point
-                sleep_time = 0.1 / self.speed_multiplier  # Check frequently
-                time.sleep(sleep_time)
+        logger.info(f"DATA SIMULATOR: Starting simulation loop with {len(self.historical_data)} data points")
+        
+        if self.tick_mode:
+            # Tick-based mode: advance one data point per tick interval
+            logger.info(f"DATA SIMULATOR: Using TICK MODE - new data every {self.tick_interval}s")
+            while self.is_running and self.current_index < len(self.historical_data):
+                if self.is_paused:
+                    time.sleep(0.1)
+                    continue
+                
+                # Check if it's time for next tick
+                time_since_last_tick = (datetime.now() - self.last_tick_time).total_seconds()
+                
+                if time_since_last_tick >= self.tick_interval:
+                    # Advance to next data point
+                    new_data = self.historical_data.iloc[self.current_index].to_dict()
+                    data_time = self.historical_data['Datetime'].iloc[self.current_index]
+                    logger.info(f"DATA SIMULATOR: ⏰ TICK {self.current_index + 1}/{len(self.historical_data)} - Price: ₹{new_data.get('Close', 0):.2f} (simulated time: {data_time})")
+                    self._notify_new_data(new_data)
+                    self.current_index += 1
+                    self.last_tick_time = datetime.now()
+                else:
+                    # Wait for next tick
+                    time.sleep(0.1)
+        else:
+            # Time-based mode: respect actual timestamps and speed multiplier
+            logger.info(f"DATA SIMULATOR: Using TIME-BASED MODE at {self.speed_multiplier}x speed")
+            while self.is_running and self.current_index < len(self.historical_data):
+                if self.is_paused:
+                    time.sleep(0.1)
+                    continue
+                
+                # Calculate current simulation time based on elapsed real time
+                real_elapsed = (datetime.now() - self.real_start_time).total_seconds()
+                sim_elapsed_seconds = real_elapsed * self.speed_multiplier
+                current_sim_time = self.simulation_start_time + timedelta(seconds=sim_elapsed_seconds)
+                
+                # Find the latest data point that should be available
+                next_data_time = self.historical_data['Datetime'].iloc[self.current_index]
+                
+                if current_sim_time >= next_data_time:
+                    # New data point is available
+                    new_data = self.historical_data.iloc[self.current_index].to_dict()
+                    logger.info(f"DATA SIMULATOR: Advancing to point {self.current_index + 1}/{len(self.historical_data)} - Price: ₹{new_data.get('Close', 0):.2f} at {next_data_time}")
+                    self._notify_new_data(new_data)
+                    self.current_index += 1
+                else:
+                    # Wait until next data point
+                    sleep_time = 0.1 / self.speed_multiplier  # Check frequently
+                    time.sleep(sleep_time)
         
         if self.current_index >= len(self.historical_data):
-            logger.info("Simulation completed - all data consumed")
+            logger.info("DATA SIMULATOR: ✅ Simulation completed - all data consumed")
             self.is_running = False
+        else:
+            logger.info(f"DATA SIMULATOR: ⏸️ Simulation stopped at point {self.current_index}/{len(self.historical_data)}")
     
     def pause(self):
         """Pause the simulation"""

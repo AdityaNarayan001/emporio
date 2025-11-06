@@ -1,6 +1,6 @@
 # 🤖 Emporio - LLM Stock Trading Simulator
 
-An intelligent stock trading simulation environment where an LLM (Google Gemini) autonomously trades IRCTC stock using historical data, simulating real-time market conditions.
+> An autonomous AI trading system where a Large Language Model (Gemini 2.0) learns to trade IRCTC stock in **async real-time simulation**.
 
 ## ⚡ Quick Start
 
@@ -9,24 +9,27 @@ An intelligent stock trading simulation environment where an LLM (Google Gemini)
 pip install -r requirements.txt
 
 # 2. Add your Gemini API key to config/config.yaml
-#    Find: api_keys.gemini_api_key and replace with your key
+#    Find: llm.api_key and replace with your key
 #    Get key: https://makersuite.google.com/app/apikey
 
 # 3. Run the simulator
 python main.py
 ```
 
-That's it! The UI will open in your browser. Click "Initialize System" → "Start Simulation" to begin.
+That's it! The UI will open in your browser. Click "🚀 Initialize System" → "▶️ Start Simulation" to begin.
 
 ---
 
 ## 🎯 Features
 
-- **🧠 Autonomous LLM Trading**: Gemini 2.5 Flash makes trading decisions based on market analysis
-- **📊 Real-time Simulation**: Historical data replayed as real-time feed (no lookahead bias)
+- **🧠 Autonomous LLM Trading**: Gemini 2.0 Flash makes trading decisions independently
+- **⚡ Async Real-Time Mode**: Stock prices flow continuously while LLM analyzes in background
+- **📊 Professional Charts**: Candlestick, volume, portfolio tracking with buy/sell markers
+- **🎯 Whole Shares Only**: Realistic trading with integer quantities (no fractional shares)
 - **💾 Evolving Memory**: JSON-based memory bank storing decisions, learnings, and patterns
 - **📰 News Integration**: Time-aware news search to inform trading decisions (toggle-able)
 - **📈 Interactive UI**: Beautiful Streamlit dashboard with live charts and metrics
+- **🎮 Full Control**: Pause, resume, speed control (0.5x to 20x)
 - **⚙️ Highly Configurable**: YAML configuration for all parameters
 - **🔍 Full Transparency**: See LLM's reasoning for every decision
 

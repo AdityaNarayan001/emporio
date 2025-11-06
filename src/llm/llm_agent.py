@@ -100,17 +100,19 @@ class LLMTradingAgent:
         """
         try:
             # Get memory context
+            logger.debug("LLM TOOL: Retrieving memory context...")
             memory_context = self.memory_bank.get_context_summary() if self.memory_bank else "No memory available"
+            logger.debug(f"LLM TOOL: Memory context retrieved ({len(memory_context)} characters)")
             
             # Get news context (if enabled)
             news_context = self._get_news_context(current_time)
             
-            # Calculate price trend
-            price_trend = self._format_price_trend(lookback_data) if lookback_data else "No historical data"
+                        # Calculate price trend
+            price_trend = self._format_price_trend(lookback_data) if lookback_data is not None and not lookback_data.empty else "No historical data"
             
             # Calculate price change
             price_change = 0.0
-            if lookback_data and len(lookback_data) > 1:
+            if lookback_data is not None and not lookback_data.empty and len(lookback_data) > 1:
                 prev_close = lookback_data.iloc[-2]['Close']
                 current_price = market_data.get('Close', market_data.get('price', 0))
                 price_change = ((current_price - prev_close) / prev_close * 100) if prev_close > 0 else 0
@@ -137,10 +139,13 @@ class LLMTradingAgent:
             
             # Get LLM decision
             full_prompt = f"{SYSTEM_PROMPT}\n\n{prompt}"
+            logger.info("LLM TOOL: Sending prompt to Gemini API...")
             response = self.model.generate_content(full_prompt)
+            logger.info(f"LLM TOOL: Received response ({len(response.text)} characters)")
             
             # Parse response
             decision = self._parse_decision(response.text)
+            logger.debug(f"LLM TOOL: Parsed decision - {decision['action']} {decision.get('quantity', 0)} shares")
             
             # Validate decision
             decision = self._validate_decision(decision, max_affordable, portfolio_summary)
@@ -181,8 +186,10 @@ class LLMTradingAgent:
     def _get_news_context(self, current_time: datetime) -> str:
         """Get news context for decision making"""
         if not self.news_tool or not self.news_tool.is_enabled():
+            logger.debug("LLM TOOL: News search disabled")
             return "News search not enabled"
         
+        logger.info("LLM TOOL: Searching for news...")
         # Search for relevant news
         keywords = ["IRCTC", "Indian Railways", "railway stocks"]
         news_context = self.news_tool.search_for_trading(
@@ -192,6 +199,7 @@ class LLMTradingAgent:
             max_results_per_keyword=2
         )
         
+        logger.info(f"LLM TOOL: News search completed, {len(news_context)} characters returned")
         return news_context
     
     def _format_price_trend(self, lookback_data) -> str:

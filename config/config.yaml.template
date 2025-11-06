@@ -30,15 +30,17 @@ llm:
 # Tools Configuration
 tools:
   news_search:
-    enabled: true # Toggle news search feature
+    enabled: true # Toggle news search feature (set to false if you don't have NewsAPI key)
     provider: "newsapi" # newsapi or manual fallback
-    api_key: "YOUR_NEWSAPI_KEY_HERE" # Optional - Get from: https://newsapi.org/register
+    api_key: "YOUR_NEWSAPI_KEY_HERE" # Optional - Get from: https://newsapi.org/register (Free tier has limitations)
     max_articles: 5 # Maximum news articles to fetch per query
     search_keywords:
       - "IRCTC"
       - "Indian Railways"
       - "railway stocks"
       - "railway booking"
+    # NOTE: NewsAPI free tier only allows requests for articles from the last 30 days
+    # If you see 401 errors, either get a valid API key or set enabled: false above
 
 # Memory Bank Configuration
 memory:
