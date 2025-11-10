@@ -85,6 +85,8 @@ def initialize_session_state(config):
         st.session_state.llm_thinking = False  # Loading indicator for LLM
         st.session_state.last_llm_decision_time = None  # Track when LLM last made a decision
         st.session_state.llm_decision_thread = None  # Background thread for LLM decisions
+        st.session_state.pending_decision_data = None  # Data waiting for LLM decision (tick mode)
+        st.session_state.decision_lock = threading.Lock()  # Thread safety for decision data
 
 
 def initialize_components(config):
@@ -132,8 +134,12 @@ def initialize_components(config):
 
             # Register tick-based LLM decision callback if configured
             if config['llm'].get('decision_mode', 'interval') == 'tick':
-                logger.info("DECISION MODE: Tick-based evaluation enabled")
+                logger.info("DECISION MODE: Tick-based evaluation enabled (non-blocking)")
                 def _tick_decision_callback(new_data):
+                    """
+                    Fast tick callback - just queues decision data without blocking simulator thread.
+                    The background decision thread will process queued data and make LLM calls.
+                    """
                     try:
                         if not st.session_state.simulation_started:
                             return
@@ -143,66 +149,25 @@ def initialize_components(config):
                         now_real = datetime.now()
                         if last_t and (now_real - last_t).total_seconds() < cooldown:
                             return
-                        # Build necessary context
+                        
+                        # Quick context gather (no LLM call yet - that happens in background thread)
                         sim_time = st.session_state.simulator.get_current_time() or now_real
-                        lookback_data = st.session_state.simulator.get_available_data()
-                        current_prices = {config['trading']['stock_symbol']: new_data['Close']}
-                        portfolio_summary = st.session_state.portfolio.get_summary(current_prices)
-                        max_affordable = st.session_state.executor.get_max_affordable_quantity(
-                            config['trading']['stock_symbol'], new_data['Close']
-                        )
-                        decision = st.session_state.llm_agent.make_decision(
-                            market_data=new_data,
-                            portfolio_summary=portfolio_summary,
-                            current_time=sim_time,
-                            max_affordable=max_affordable,
-                            lookback_data=lookback_data
-                        )
-                        st.session_state.last_decision = decision
-                        st.session_state.decisions_log.append({
-                            'timestamp': sim_time,
-                            'decision': decision
-                        })
-                        st.session_state.last_llm_decision_time = datetime.now()
-                        # Execute trade if BUY/SELL
-                        if decision['action'] != 'HOLD' and decision['quantity'] > 0:
-                            if decision['action'] == 'BUY':
-                                result = st.session_state.executor.execute_market_buy(
-                                    symbol=config['trading']['stock_symbol'],
-                                    quantity=decision['quantity'],
-                                    current_price=new_data['Close'],
-                                    timestamp=sim_time,
-                                    reason=decision['reasoning']
-                                )
-                            else:
-                                result = st.session_state.executor.execute_market_sell(
-                                    symbol=config['trading']['stock_symbol'],
-                                    quantity=decision['quantity'],
-                                    current_price=new_data['Close'],
-                                    timestamp=sim_time,
-                                    reason=decision['reasoning']
-                                )
-                            if result['success']:
-                                st.session_state.trades_log.append(result['transaction'])
-                                st.session_state.llm_agent.reflect_on_trade(
-                                    trade_result=result,
-                                    portfolio_after=st.session_state.portfolio.get_summary(current_prices)
-                                )
-                        # Performance snapshot
-                        st.session_state.performance.record_snapshot(
-                            timestamp=sim_time,
-                            portfolio_value=portfolio_summary['total_value'],
-                            cash=portfolio_summary['current_cash'],
-                            positions_value=portfolio_summary['positions_value'],
-                            positions=portfolio_summary['current_positions'],
-                            current_prices=current_prices
-                        )
-                        logger.debug(
-                            f"TICK DECISION: action={decision['action']} qty={decision.get('quantity',0)} conf={decision['confidence']:.2f}"
-                        )
+                        
+                        # Queue decision data for background thread to process
+                        with st.session_state.decision_lock:
+                            st.session_state.pending_decision_data = {
+                                'new_data': new_data,
+                                'sim_time': sim_time,
+                                'queued_at': now_real
+                            }
+                        logger.debug(f"TICK: Queued decision data at price ₹{new_data['Close']:.2f}")
                     except Exception as e:
-                        logger.error(f"Tick decision callback error: {e}")
+                        logger.error(f"Tick callback error: {e}")
                 st.session_state.simulator.register_callback(_tick_decision_callback)
+                
+                # Start background decision processor for tick mode
+                logger.info("TICK MODE: Starting non-blocking decision processor thread")
+                start_tick_decision_processor()
             else:
                 logger.info("DECISION MODE: Interval-based background thread evaluation")
             
@@ -580,7 +545,7 @@ def render_price_chart():
     fig.update_yaxes(title_text="Price (₹)", row=1, col=1)
     fig.update_yaxes(title_text="Value (₹)", row=2, col=1)
     
-    st.plotly_chart(fig, key="irctc_chart")
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def render_llm_activity():
@@ -738,7 +703,7 @@ def render_trades_table():
     display_df = df[['timestamp', 'type', 'quantity', 'price', 'total_cost', 'cash_after']].copy()
     display_df.columns = ['Time', 'Type', 'Qty', 'Price (₹)', 'Total (₹)', 'Cash After (₹)']
     
-    st.dataframe(display_df, hide_index=True, key="trades_table")
+    st.dataframe(display_df, hide_index=True)
 
 
 def render_memory_bank():
@@ -984,6 +949,129 @@ def llm_decision_loop():
             time_module.sleep(5)  # Wait before retrying
 
 
+def tick_decision_processor():
+    """
+    Background thread that processes queued tick decision data without blocking the simulator.
+    This allows the graph to update in real-time while LLM is thinking.
+    """
+    logger.info("TICK PROCESSOR: Non-blocking decision processor started")
+    
+    while st.session_state.get('simulation_started', False):
+        try:
+            # Check if simulation is paused
+            if st.session_state.simulator.is_paused or not st.session_state.simulator.is_running:
+                time_module.sleep(0.5)
+                continue
+            
+            # Check for pending decision data
+            decision_data = None
+            with st.session_state.decision_lock:
+                if st.session_state.pending_decision_data:
+                    decision_data = st.session_state.pending_decision_data
+                    st.session_state.pending_decision_data = None  # Clear queue
+            
+            if not decision_data:
+                time_module.sleep(0.1)  # Poll every 100ms
+                continue
+            
+            # Mark LLM as thinking (UI will show indicator)
+            st.session_state.llm_thinking = True
+            
+            new_data = decision_data['new_data']
+            sim_time = decision_data['sim_time']
+            
+            # Build full context
+            lookback_data = st.session_state.simulator.get_available_data()
+            current_prices = {config['trading']['stock_symbol']: new_data['Close']}
+            portfolio_summary = st.session_state.portfolio.get_summary(current_prices)
+            max_affordable = st.session_state.executor.get_max_affordable_quantity(
+                config['trading']['stock_symbol'], new_data['Close']
+            )
+            
+            logger.info(f"TICK PROCESSOR: Making LLM decision at price ₹{new_data['Close']:.2f}")
+            decision_start = datetime.now()
+            
+            # LLM API call (this is the blocking part, but it runs in this background thread)
+            decision = st.session_state.llm_agent.make_decision(
+                market_data=new_data,
+                portfolio_summary=portfolio_summary,
+                current_time=sim_time,
+                max_affordable=max_affordable,
+                lookback_data=lookback_data
+            )
+            
+            decision_duration = (datetime.now() - decision_start).total_seconds()
+            logger.info(f"TICK PROCESSOR: Decision complete in {decision_duration:.2f}s - {decision['action']} (conf: {decision['confidence']:.2f})")
+            
+            # Update state atomically
+            st.session_state.last_decision = decision
+            st.session_state.decisions_log.append({
+                'timestamp': sim_time,
+                'decision': decision
+            })
+            st.session_state.last_llm_decision_time = datetime.now()
+            st.session_state.llm_thinking = False
+            
+            # Execute trade if BUY/SELL
+            if decision['action'] != 'HOLD' and decision['quantity'] > 0:
+                if decision['action'] == 'BUY':
+                    result = st.session_state.executor.execute_market_buy(
+                        symbol=config['trading']['stock_symbol'],
+                        quantity=decision['quantity'],
+                        current_price=new_data['Close'],
+                        timestamp=sim_time,
+                        reason=decision['reasoning']
+                    )
+                else:
+                    result = st.session_state.executor.execute_market_sell(
+                        symbol=config['trading']['stock_symbol'],
+                        quantity=decision['quantity'],
+                        current_price=new_data['Close'],
+                        timestamp=sim_time,
+                        reason=decision['reasoning']
+                    )
+                if result['success']:
+                    st.session_state.trades_log.append(result['transaction'])
+                    st.session_state.llm_agent.reflect_on_trade(
+                        trade_result=result,
+                        portfolio_after=st.session_state.portfolio.get_summary(current_prices)
+                    )
+                    logger.info(f"TICK PROCESSOR: Trade executed - {decision['action']} {decision['quantity']} shares")
+            
+            # Performance snapshot
+            st.session_state.performance.record_snapshot(
+                timestamp=sim_time,
+                portfolio_value=portfolio_summary['total_value'],
+                cash=portfolio_summary['current_cash'],
+                positions_value=portfolio_summary['positions_value'],
+                positions=portfolio_summary['current_positions'],
+                current_prices=current_prices
+            )
+            
+        except Exception as e:
+            logger.error(f"TICK PROCESSOR: Error processing decision: {e}", exc_info=True)
+            st.session_state.llm_thinking = False
+            time_module.sleep(1)
+    
+    logger.info("TICK PROCESSOR: Thread exiting")
+
+
+def start_tick_decision_processor():
+    """Start the non-blocking tick decision processor thread"""
+    if not hasattr(st.session_state, 'tick_processor_thread') or \
+       st.session_state.tick_processor_thread is None or \
+       not st.session_state.tick_processor_thread.is_alive():
+        thread = threading.Thread(target=tick_decision_processor, daemon=True, name="tick_decision_processor")
+        if add_script_run_ctx is not None:
+            try:
+                add_script_run_ctx(thread)
+            except Exception as e:
+                logger.warning(f"Failed to attach context to tick processor: {e}")
+        thread.start()
+        st.session_state.tick_processor_thread = thread
+        logger.info("Tick decision processor thread started")
+
+
 def start_llm_decision_thread():
     """Start the background LLM decision thread"""
     if st.session_state.llm_decision_thread is None or not st.session_state.llm_decision_thread.is_alive():
@@ -1062,10 +1150,19 @@ def main():
         render_memory_bank()
         
         # Auto-refresh only when simulation is running and not paused
+        # Use st.empty() placeholder to enable non-blocking refresh without sleep
         if st.session_state.simulation_started and not st.session_state.simulator.is_paused:
-            logger.debug("UI AUTO-REFRESH: Waiting 2 seconds before next refresh")
-            time_module.sleep(2)  # Refresh every 2 seconds for smooth updates
+            # Non-blocking refresh every 2 seconds
+            # This allows the UI to update even while LLM is thinking
+            placeholder = st.empty()
+            with placeholder.container():
+                st.caption(f"🔄 Live updates enabled (refreshing every 2s)")
+            time_module.sleep(2)
             st.rerun()
+        else:
+            # When paused, show status and wait for user action
+            if st.session_state.simulation_started:
+                st.info("⏸️ Simulation paused. Click Resume to continue.")
 
 
 if __name__ == "__main__":
