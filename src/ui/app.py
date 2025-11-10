@@ -141,11 +141,17 @@ def initialize_components(config):
                     The background decision thread will process queued data and make LLM calls.
                     """
                     try:
-                        if not st.session_state.simulation_started:
+                        # Safety check: ensure session_state is initialized
+                        if not hasattr(st, 'session_state'):
                             return
+                        if not hasattr(st.session_state, 'simulation_started') or not st.session_state.simulation_started:
+                            return
+                        if not hasattr(st.session_state, 'simulator') or st.session_state.simulator is None:
+                            return
+                        
                         # Cooldown enforcement
                         cooldown = config['llm'].get('min_seconds_between_decisions', 5)
-                        last_t = st.session_state.last_llm_decision_time
+                        last_t = getattr(st.session_state, 'last_llm_decision_time', None)
                         now_real = datetime.now()
                         if last_t and (now_real - last_t).total_seconds() < cooldown:
                             return
@@ -154,13 +160,14 @@ def initialize_components(config):
                         sim_time = st.session_state.simulator.get_current_time() or now_real
                         
                         # Queue decision data for background thread to process
-                        with st.session_state.decision_lock:
-                            st.session_state.pending_decision_data = {
-                                'new_data': new_data,
-                                'sim_time': sim_time,
-                                'queued_at': now_real
-                            }
-                        logger.debug(f"TICK: Queued decision data at price ₹{new_data['Close']:.2f}")
+                        if hasattr(st.session_state, 'decision_lock'):
+                            with st.session_state.decision_lock:
+                                st.session_state.pending_decision_data = {
+                                    'new_data': new_data,
+                                    'sim_time': sim_time,
+                                    'queued_at': now_real
+                                }
+                            logger.debug(f"TICK: Queued decision data at price ₹{new_data['Close']:.2f}")
                     except Exception as e:
                         logger.error(f"Tick callback error: {e}")
                 st.session_state.simulator.register_callback(_tick_decision_callback)
@@ -231,8 +238,62 @@ def initialize_components(config):
 
 
 def render_header():
-    """Render application header"""
-    st.title("🤖 Emporio - LLM Stock Trading Simulator")
+    """Render application header with improved styling"""
+    # Custom CSS for better UI consistency
+    st.markdown("""
+        <style>
+        /* Main title styling */
+        .main-title {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(90deg, #1f77b4, #2ca02c);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+        
+        /* Metric cards */
+        [data-testid="stMetricValue"] {
+            font-size: 1.8rem;
+            font-weight: 600;
+        }
+        
+        /* Consistent spacing */
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 2rem;
+        }
+        
+        /* Better button styling */
+        .stButton > button {
+            width: 100%;
+            border-radius: 8px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+        
+        /* Expander styling */
+        .streamlit-expander {
+            border: 1px solid rgba(49, 51, 63, 0.2);
+            border-radius: 8px;
+            margin-bottom: 1rem;
+        }
+        
+        /* Info boxes */
+        .stInfo, .stSuccess, .stWarning, .stError {
+            border-radius: 8px;
+            padding: 1rem;
+        }
+        
+        /* Sidebar improvements */
+        [data-testid="stSidebar"] {
+            background-color: rgba(240, 242, 246, 0.5);
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<h1 class="main-title">🤖 Emporio - LLM Stock Trading Simulator</h1>', unsafe_allow_html=True)
+    st.caption("Autonomous AI-Powered Trading System | Real-Time Market Analysis")
     st.markdown("---")
 
 
@@ -317,7 +378,7 @@ def render_control_panel():
 
 
 def render_metrics():
-    """Render key metrics"""
+    """Render key metrics with improved styling and consistency"""
     if not st.session_state.initialized or not st.session_state.simulator:
         return
     
@@ -334,31 +395,46 @@ def render_metrics():
     current_prices = {config['trading']['stock_symbol']: current_data['Close']}
     portfolio_summary = st.session_state.portfolio.get_summary(current_prices)
     
-    # Display metrics
+    # Display metrics in consistent card-style layout
     col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
+        return_pct = portfolio_summary['return_percentage']
+        delta_color = "normal" if return_pct >= 0 else "inverse"
         st.metric(
-            "Portfolio Value",
-            f"₹{portfolio_summary['total_value']:.2f}",
-            f"{portfolio_summary['return_percentage']:.2f}%"
+            label="💰 Portfolio Value",
+            value=f"₹{portfolio_summary['total_value']:,.2f}",
+            delta=f"{return_pct:+.2f}%",
+            delta_color=delta_color
         )
     
     with col2:
         st.metric(
-            "Cash",
-            f"₹{portfolio_summary['current_cash']:.2f}"
+            label="💵 Available Cash",
+            value=f"₹{portfolio_summary['current_cash']:,.2f}"
         )
     
     with col3:
         positions = portfolio_summary['current_positions']
-        pos_str = f"{positions.get(config['trading']['stock_symbol'], 0)} shares"
-        st.metric("Position", pos_str)
+        shares_held = positions.get(config['trading']['stock_symbol'], 0)
+        st.metric(
+            label="📊 Position",
+            value=f"{shares_held} shares"
+        )
     
     with col4:
+        price_change = current_data.get('Close', 0) - current_data.get('Open', current_data.get('Close', 0))
         st.metric(
-            "Current Price",
-            f"₹{current_data['Close']:.2f}"
+            label="📈 Current Price",
+            value=f"₹{current_data['Close']:,.2f}",
+            delta=f"₹{price_change:+.2f}" if abs(price_change) > 0.01 else None
+        )
+    
+    with col5:
+        st.metric(
+            label="⏱️ Progress",
+            value=f"{progress['progress_percentage']:.1f}%",
+            delta=f"{progress['current_index']}/{progress['total_points']}"
         )
     
     with col5:
@@ -549,101 +625,140 @@ def render_price_chart():
 
 
 def render_llm_activity():
-    """Render LLM decision activity"""
-    st.subheader("🧠 LLM Activity")
+    """Render LLM decision activity with improved UI"""
+    st.subheader("🧠 AI Decision Engine")
     
-    # Show loading indicator when LLM is thinking
+    # Show loading indicator when LLM is thinking with better styling
     if st.session_state.get('llm_thinking', False):
-        st.info("� Thinking... Analyzing market data, news, and patterns...")
+        st.markdown("""
+            <div style='padding: 1rem; background-color: rgba(255, 193, 7, 0.1); border-left: 4px solid #ffc107; border-radius: 4px;'>
+                <strong>🤖 AI Analyzing...</strong><br/>
+                <small>Processing market data, news, and historical patterns</small>
+            </div>
+        """, unsafe_allow_html=True)
+        st.progress(0.5, text="LLM API call in progress...")
     
     # Show next decision countdown in continuous mode
-    if st.session_state.get('simulation_started') and config.get('simulation', {}).get('continuous_mode', True):
-        if st.session_state.last_llm_decision_time:
-            interval = config['simulation'].get('llm_check_interval', 30)
-            next_check = st.session_state.last_llm_decision_time + timedelta(seconds=interval)
-            time_until = (next_check - datetime.now()).total_seconds()
-            
-            if time_until > 0:
-                st.caption(f"⏱️ Next market check in: {int(time_until)}s")
+    decision_mode = config['llm'].get('decision_mode', 'interval')
+    if st.session_state.get('simulation_started'):
+        if decision_mode == 'tick':
+            cooldown = config['llm'].get('min_seconds_between_decisions', 5)
+            if st.session_state.last_llm_decision_time:
+                time_since = (datetime.now() - st.session_state.last_llm_decision_time).total_seconds()
+                if time_since < cooldown:
+                    st.caption(f"⏱️ Cooldown: {cooldown - time_since:.0f}s remaining")
+                else:
+                    st.caption("✅ Ready for next decision")
             else:
-                st.caption("🔄 Analyzing market now...")
-        else:
-            st.caption("🔄 Preparing first market analysis...")
+                st.caption("🔄 Preparing first decision...")
+        elif config.get('simulation', {}).get('continuous_mode', True):
+            if st.session_state.last_llm_decision_time:
+                interval = config['simulation'].get('llm_check_interval', 30)
+                next_check = st.session_state.last_llm_decision_time + timedelta(seconds=interval)
+                time_until = (next_check - datetime.now()).total_seconds()
+                
+                if time_until > 0:
+                    st.caption(f"⏱️ Next check in: {int(time_until)}s")
+                else:
+                    st.caption("🔄 Analyzing now...")
+            else:
+                st.caption("🔄 Preparing first analysis...")
     
     if st.session_state.last_decision:
         decision = st.session_state.last_decision
         
-        # Decision box with color coding
-        decision_color = {
-            'BUY': '🟢',
-            'SELL': '🔴',
-            'HOLD': '🟡'
-        }.get(decision['action'], '⚪')
+        # Decision box with improved color coding and styling
+        decision_styles = {
+            'BUY': {'emoji': '🟢', 'color': '#28a745', 'bg': 'rgba(40, 167, 69, 0.1)'},
+            'SELL': {'emoji': '🔴', 'color': '#dc3545', 'bg': 'rgba(220, 53, 69, 0.1)'},
+            'HOLD': {'emoji': '🟡', 'color': '#ffc107', 'bg': 'rgba(255, 193, 7, 0.1)'}
+        }
         
-        # Action badge
-        action_style = {
-            'BUY': 'background-color: #28a745; color: white; padding: 5px 15px; border-radius: 5px; font-weight: bold;',
-            'SELL': 'background-color: #dc3545; color: white; padding: 5px 15px; border-radius: 5px; font-weight: bold;',
-            'HOLD': 'background-color: #ffc107; color: black; padding: 5px 15px; border-radius: 5px; font-weight: bold;'
-        }.get(decision['action'], '')
+        style = decision_styles.get(decision['action'], {'emoji': '⚪', 'color': '#6c757d', 'bg': 'rgba(108, 117, 125, 0.1)'})
         
-        st.markdown(f"### {decision_color} Last Decision")
-        st.markdown(f"<span style='{action_style}'>{decision['action']}</span>", unsafe_allow_html=True)
+        # Action badge with better styling
+        st.markdown(f"""
+            <div style='padding: 1.5rem; background: {style['bg']}; border-radius: 8px; border-left: 4px solid {style['color']}; margin-bottom: 1rem;'>
+                <div style='display: flex; align-items: center; gap: 1rem; margin-bottom: 0.5rem;'>
+                    <span style='font-size: 2rem;'>{style['emoji']}</span>
+                    <span style='background-color: {style['color']}; color: white; padding: 0.5rem 1.5rem; border-radius: 20px; font-weight: 700; font-size: 1.1rem;'>
+                        {decision['action']}
+                    </span>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
         
         col1, col2 = st.columns([2, 1])
         
         with col1:
-            st.markdown(f"**💭 Reasoning:**")
+            st.markdown("**💭 AI Reasoning:**")
             # Sanitize reasoning to avoid duplicated metric blocks or stray JSON braces
             raw_reason = decision.get('reasoning', '')
             cleaned = _clean_reasoning(raw_reason)
             # Use a scrollable container to prevent layout overflow
             st.markdown(
-                f"<div style='max-height:220px; overflow-y:auto; padding:8px; background:#1e1e1e; border:1px solid #444; border-radius:6px; font-size:14px;'>{cleaned}</div>",
+                f"<div style='max-height:250px; overflow-y:auto; padding:12px; background:rgba(30,30,30,0.5); border:1px solid rgba(100,100,100,0.3); border-radius:8px; font-size:14px; line-height:1.6;'>{cleaned}</div>",
                 unsafe_allow_html=True
             )
+            
+            # Show expected outcome if available
             
             # Show expected outcome if available
             if decision.get('expected_outcome'):
                 st.markdown(f"**🎯 Expected Outcome:** {decision['expected_outcome']}")
         
         with col2:
-            st.metric("Confidence", f"{decision['confidence']:.0%}")
-            st.metric("Risk Level", decision.get('risk_level', 'N/A'))
+            # Decision metrics in card style
+            st.metric(
+                label="🎯 Confidence",
+                value=f"{decision['confidence']:.0%}",
+                delta="High" if decision['confidence'] >= 0.7 else "Medium" if decision['confidence'] >= 0.5 else "Low"
+            )
+            st.metric(
+                label="⚠️ Risk Level",
+                value=decision.get('risk_level', 'N/A')
+            )
             if decision.get('quantity', 0) > 0:
-                st.metric("Quantity", f"{decision['quantity']} shares")
+                st.metric(
+                    label="📊 Quantity",
+                    value=f"{decision['quantity']} shares"
+                )
             
             # Show stop loss and take profit if available
             if decision.get('stop_loss'):
-                st.markdown(f"**🛑 Stop Loss:** ₹{decision['stop_loss']:.2f}")
+                st.markdown(f"**🛑 Stop Loss:** ₹{decision['stop_loss']:,.2f}")
             if decision.get('take_profit'):
-                st.markdown(f"**✅ Take Profit:** ₹{decision['take_profit']:.2f}")
+                st.markdown(f"**✅ Take Profit:** ₹{decision['take_profit']:,.2f}")
     else:
-        st.info("💤 Waiting for first trading decision...")
+        st.info("💤 Awaiting first AI trading decision...")
 
-    # Debug visibility panel
+    # Debug visibility panel with better styling
     if st.session_state.llm_agent and config['llm'].get('debug', False):
-        with st.expander("🔍 LLM Debug Visibility"):
+        with st.expander("🔍 **LLM Debug Console**", expanded=False):
             vis = st.session_state.llm_agent.get_visibility()
-            st.markdown("**Model:** " + vis.get('model_name', 'N/A'))
-            st.markdown(f"**Decisions Made:** {vis.get('decision_count', 0)}")
-            st.markdown(f"**Last Decision Time:** {vis.get('last_decision_time', 'None')}")
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Model", vis.get('model_name', 'N/A'))
+            with col2:
+                st.metric("Total Decisions", vis.get('decision_count', 0))
+            with col3:
+                last_time = vis.get('last_decision_time', 'None')
+                st.metric("Last Decision", str(last_time)[:19] if last_time != 'None' else 'None')
+            
             if vis.get('last_error'):
-                st.error(f"Last Error: {vis['last_error']}")
+                st.error(f"⚠️ **Last Error:** {vis['last_error']}")
+            
             if vis.get('last_prompt'):
-                st.markdown("**Last Prompt:**")
-                st.markdown(
-                    f"<div style='max-height:300px; overflow:auto; border:1px solid #444; padding:8px; border-radius:6px; font-size:13px; background:#111;'>{st.session_state.llm_agent.last_prompt.replace('<','&lt;').replace('>','&gt;')}</div>",
-                    unsafe_allow_html=True
-                )
+                st.markdown("**📝 Last Prompt:**")
+                st.code(st.session_state.llm_agent.last_prompt, language="text")
+            
             if vis.get('last_raw_response'):
-                st.markdown("**Last Raw Response:**")
-                st.markdown(
-                    f"<div style='max-height:300px; overflow:auto; white-space:pre-wrap; border:1px solid #444; padding:8px; border-radius:6px; font-size:13px; background:#111;'>{vis['last_raw_response'].replace('<','&lt;').replace('>','&gt;')}</div>",
-                    unsafe_allow_html=True
-                )
-            # Manual trigger
-            if st.button("⚡ Force Decision Now", key="force_decision_btn"):
+                st.markdown("**📨 Last Response:**")
+                st.code(vis['last_raw_response'][:1000], language="text")  # Limit display
+            
+            # Manual trigger with better button
+            if st.button("⚡ **Force Decision Now**", key="force_decision_btn", type="primary"):
                 try:
                     current_data = st.session_state.simulator.get_current_data()
                     lookback_data = st.session_state.simulator.get_available_data()
@@ -688,22 +803,42 @@ def _clean_reasoning(text: str) -> str:
 
 
 def render_trades_table():
-    """Render recent trades table"""
-    st.subheader("📊 Recent Trades")
+    """Render recent trades table with improved styling"""
+    st.subheader("📊 Trade History")
     
     if not st.session_state.trades_log:
-        st.info("No trades executed yet")
+        st.info("📭 No trades executed yet. Waiting for AI decisions...")
         return
     
     # Convert to DataFrame
     df = pd.DataFrame(st.session_state.trades_log[-10:])  # Last 10 trades
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     
-    # Format columns
+    # Format columns with better labels
     display_df = df[['timestamp', 'type', 'quantity', 'price', 'total_cost', 'cash_after']].copy()
-    display_df.columns = ['Time', 'Type', 'Qty', 'Price (₹)', 'Total (₹)', 'Cash After (₹)']
+    display_df.columns = ['📅 Time', '🔄 Type', '📊 Quantity', '💰 Price (₹)', '💵 Total Cost (₹)', '🏦 Cash After (₹)']
     
-    st.dataframe(display_df, hide_index=True)
+    # Format numbers with commas
+    display_df['💰 Price (₹)'] = display_df['💰 Price (₹)'].apply(lambda x: f"₹{x:,.2f}")
+    display_df['💵 Total Cost (₹)'] = display_df['💵 Total Cost (₹)'].apply(lambda x: f"₹{x:,.2f}")
+    display_df['🏦 Cash After (₹)'] = display_df['🏦 Cash After (₹)'].apply(lambda x: f"₹{x:,.2f}")
+    display_df['📅 Time'] = display_df['📅 Time'].dt.strftime('%Y-%m-%d %H:%M')
+    
+    # Display with better formatting
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+    # Summary stats
+    total_trades = len(st.session_state.trades_log)
+    buy_trades = len([t for t in st.session_state.trades_log if t['type'] == 'BUY'])
+    sell_trades = len([t for t in st.session_state.trades_log if t['type'] == 'SELL'])
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Trades", total_trades)
+    with col2:
+        st.metric("Buy Orders", buy_trades)
+    with col3:
+        st.metric("Sell Orders", sell_trades)
 
 
 def render_memory_bank():
