@@ -142,6 +142,9 @@ class NewsSearchTool:
                 to_date=to_date,
                 max_results=max_results_per_keyword
             )
+            logger.debug(
+                f"NEWS DEBUG: keyword='{keyword}' returned {len(articles)} articles (range {from_date.date()} to {to_date.date()})"
+            )
             all_articles.extend(articles)
         
         if not all_articles:
@@ -157,8 +160,9 @@ class NewsSearchTool:
                 unique_articles.append(article)
         
         # Format news context
-        news_lines = [f"Found {len(unique_articles)} relevant news articles:\n"]
-        
+        news_lines = [
+            f"Found {len(unique_articles)} relevant news articles (keywords: {', '.join(keywords)}):\n"
+        ]
         for i, article in enumerate(unique_articles[:10], 1):  # Limit to 10 articles
             news_lines.append(f"{i}. {article['title']}")
             news_lines.append(f"   Source: {article['source']} | Published: {article['published_at']}")
@@ -166,7 +170,7 @@ class NewsSearchTool:
                 desc = article['description'][:150] + "..." if len(article['description']) > 150 else article['description']
                 news_lines.append(f"   {desc}")
             news_lines.append("")
-        
+
         return "\n".join(news_lines)
     
     def is_enabled(self) -> bool:

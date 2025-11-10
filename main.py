@@ -23,6 +23,15 @@ logging.basicConfig(
     ]
 )
 
+# Add unified debug log file capturing all levels for deeper inspection
+unified_log_path = log_dir / 'log.txt'
+if not any(isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', '') == str(unified_log_path) for h in logging.getLogger().handlers):
+    unified_handler = logging.FileHandler(unified_log_path)
+    unified_handler.setLevel(logging.DEBUG)
+    unified_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(module)s - %(funcName)s - %(message)s'))
+    logging.getLogger().addHandler(unified_handler)
+    logging.getLogger(__name__).info(f"Unified debug log initialized at {unified_log_path}")
+
 logger = logging.getLogger(__name__)
 
 

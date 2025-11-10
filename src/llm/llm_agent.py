@@ -29,7 +29,8 @@ class LLMTradingAgent:
         temperature: float = 0.7,
         memory_bank: Optional[MemoryBank] = None,
         news_tool: Optional[NewsSearchTool] = None,
-        min_confidence: float = 0.6
+        min_confidence: float = 0.6,
+        debug: bool = False
     ):
         """
         Initialize LLM Trading Agent
@@ -75,7 +76,14 @@ class LLMTradingAgent:
         self.last_decision_time = None
         self.decision_count = 0
         
-        logger.info(f"LLM Trading Agent initialized with {model_name}")
+        # Debug / visibility state (correctly scoped inside __init__)
+        self.debug = debug
+        self.last_prompt = None
+        self.last_raw_response = None
+        self.last_decision = None
+        self.last_error = None
+
+        logger.info(f"LLM Trading Agent initialized with {self.model_name} (debug={self.debug})")
     
     def make_decision(
         self,
@@ -140,11 +148,16 @@ class LLMTradingAgent:
             # Get LLM decision
             full_prompt = f"{SYSTEM_PROMPT}\n\n{prompt}"
             logger.info("LLM TOOL: Sending prompt to Gemini API...")
+            # Save prompt for visibility
+            self.last_prompt = full_prompt
             response = self.model.generate_content(full_prompt)
-            logger.info(f"LLM TOOL: Received response ({len(response.text)} characters)")
+            # Safely extract text from multi-part responses
+            extracted_text = self._extract_response_text(response)
+            logger.info(f"LLM TOOL: Received response ({len(extracted_text)} characters)")
+            self.last_raw_response = extracted_text
             
             # Parse response
-            decision = self._parse_decision(response.text)
+            decision = self._parse_decision(extracted_text)
             logger.debug(f"LLM TOOL: Parsed decision - {decision['action']} {decision.get('quantity', 0)} shares")
             
             # Validate decision
@@ -171,9 +184,11 @@ class LLMTradingAgent:
                 f"(confidence: {decision['confidence']:.2f})"
             )
             
+            self.last_decision = decision
             return decision
             
         except Exception as e:
+            self.last_error = str(e)
             logger.error(f"Error making decision: {str(e)}")
             return {
                 "action": "HOLD",
@@ -218,6 +233,10 @@ class LLMTradingAgent:
     
     def _parse_decision(self, response_text: str) -> Dict:
         """Parse LLM response into decision dictionary"""
+        if self.debug:
+            logger.debug("DEBUG: Raw LLM response start >>>")
+            logger.debug(response_text)  # full, UI handles scroll
+            logger.debug("DEBUG: Raw LLM response end <<<")
         # Try to extract JSON from response
         json_match = re.search(r'```json\s*(\{.*?\})\s*```', response_text, re.DOTALL)
         
@@ -232,7 +251,8 @@ class LLMTradingAgent:
         decision = {
             "action": "HOLD",
             "quantity": 0,
-            "reasoning": response_text[:500],
+            # Keep full cleaned reasoning (no truncation; UI scroll handles length)
+            "reasoning": self._clean_reasoning_text(response_text),
             "confidence": 0.5,
             "risk_level": "MEDIUM"
         }
@@ -254,6 +274,66 @@ class LLMTradingAgent:
             decision["confidence"] = float(conf_match.group(1))
         
         return decision
+
+    def _clean_reasoning_text(self, raw: str) -> str:
+        """Remove duplicated metric tokens from raw LLM response before storing as reasoning."""
+        if not raw:
+            return ""
+        patterns = [r'^Confidence:?\s*[0-9.]+%?$', r'^Risk Level:?\s*\w+$', r'^Quantity:?\s*\d+$']
+        lines = raw.splitlines()
+        import re
+        kept = []
+        for ln in lines:
+            if any(re.match(p, ln.strip(), re.IGNORECASE) for p in patterns):
+                continue
+            kept.append(ln)
+        cleaned = '\n'.join(kept)
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+        return cleaned
+
+    def _extract_response_text(self, response) -> str:
+        """Handle Gemini multi-part responses robustly returning concatenated text."""
+        try:
+            if hasattr(response, 'text') and isinstance(response.text, str):
+                # Some simple responses still work
+                return response.text
+        except Exception:
+            pass
+        parts_text = []
+        try:
+            # Preferred: response.parts
+            if hasattr(response, 'parts') and response.parts:
+                for p in response.parts:
+                    if hasattr(p, 'text') and p.text:
+                        parts_text.append(p.text)
+                    elif isinstance(getattr(p, 'content', None), str):
+                        parts_text.append(p.content)
+            # Fallback: response.candidates
+            elif hasattr(response, 'candidates') and response.candidates:
+                for cand in response.candidates:
+                    content = getattr(cand, 'content', None)
+                    if content and hasattr(content, 'parts'):
+                        for part in content.parts:
+                            if hasattr(part, 'text') and part.text:
+                                parts_text.append(part.text)
+            combined = "\n".join(parts_text).strip()
+            return combined or "(Empty response)"
+        except Exception as e:
+            logger.error(f"Failed to extract multi-part response text: {e}")
+            return f"(Extraction error: {e})"
+
+    def get_visibility(self) -> Dict:
+        """Return internal visibility state for debugging/UI"""
+        return {
+            "last_prompt": self.last_prompt,
+            "last_raw_response": (self.last_raw_response[:2000] + '…') if self.last_raw_response and len(self.last_raw_response) > 2000 else self.last_raw_response,
+            "last_decision": self.last_decision,
+            "last_error": self.last_error,
+            "decision_count": self.decision_count,
+            "last_decision_time": self.last_decision_time.isoformat() if self.last_decision_time else None,
+            "min_confidence": self.min_confidence,
+            "model_name": self.model_name
+        }
     
     def _normalize_decision(self, decision: Dict) -> Dict:
         """Normalize and validate decision format"""

@@ -26,12 +26,33 @@ from src.tools.news_search import NewsSearchTool
 import yaml
 import logging
 
+# Attempt to import Streamlit helper to attach ScriptRunContext to background threads
+try:
+    from streamlit.runtime.scriptrunner import add_script_run_ctx  # Streamlit >=1.25
+except Exception:  # pragma: no cover - older/newer versions may differ
+    add_script_run_ctx = None
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Ensure unified debug log exists (same logic as main.py)
+try:
+    log_dir = os.path.join(os.getcwd(), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    unified_log_file = os.path.join(log_dir, 'log.txt')
+    root_logger = logging.getLogger()
+    if not any(isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', '') == unified_log_file for h in root_logger.handlers):
+        fh = logging.FileHandler(unified_log_file)
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(module)s - %(funcName)s - %(message)s'))
+        root_logger.addHandler(fh)
+        logger.info(f"UI: Attached unified debug log handler at {unified_log_file}")
+except Exception as e:
+    logger.error(f"UI: Failed to attach unified debug log handler: {e}")
 
 
 def load_config():
@@ -69,6 +90,13 @@ def initialize_session_state(config):
 def initialize_components(config):
     """Initialize all trading components"""
     try:
+        # Guard: don't reinitialize if already done (prevents decision_count resets)
+        if st.session_state.get('initialized'):
+            logger.info("INIT GUARD: Components already initialized; skipping re-init.")
+            # Ensure background thread running if simulation started
+            if config.get('simulation', {}).get('auto_start', False) and st.session_state.get('simulation_started'):
+                start_llm_decision_thread()
+            return
         logger.info("=== INITIALIZATION STARTED ===")
         with st.spinner("Initializing trading system..."):
             # Load historical data
@@ -101,6 +129,82 @@ def initialize_components(config):
                 tick_mode=tick_mode,
                 tick_interval=tick_interval
             )
+
+            # Register tick-based LLM decision callback if configured
+            if config['llm'].get('decision_mode', 'interval') == 'tick':
+                logger.info("DECISION MODE: Tick-based evaluation enabled")
+                def _tick_decision_callback(new_data):
+                    try:
+                        if not st.session_state.simulation_started:
+                            return
+                        # Cooldown enforcement
+                        cooldown = config['llm'].get('min_seconds_between_decisions', 5)
+                        last_t = st.session_state.last_llm_decision_time
+                        now_real = datetime.now()
+                        if last_t and (now_real - last_t).total_seconds() < cooldown:
+                            return
+                        # Build necessary context
+                        sim_time = st.session_state.simulator.get_current_time() or now_real
+                        lookback_data = st.session_state.simulator.get_available_data()
+                        current_prices = {config['trading']['stock_symbol']: new_data['Close']}
+                        portfolio_summary = st.session_state.portfolio.get_summary(current_prices)
+                        max_affordable = st.session_state.executor.get_max_affordable_quantity(
+                            config['trading']['stock_symbol'], new_data['Close']
+                        )
+                        decision = st.session_state.llm_agent.make_decision(
+                            market_data=new_data,
+                            portfolio_summary=portfolio_summary,
+                            current_time=sim_time,
+                            max_affordable=max_affordable,
+                            lookback_data=lookback_data
+                        )
+                        st.session_state.last_decision = decision
+                        st.session_state.decisions_log.append({
+                            'timestamp': sim_time,
+                            'decision': decision
+                        })
+                        st.session_state.last_llm_decision_time = datetime.now()
+                        # Execute trade if BUY/SELL
+                        if decision['action'] != 'HOLD' and decision['quantity'] > 0:
+                            if decision['action'] == 'BUY':
+                                result = st.session_state.executor.execute_market_buy(
+                                    symbol=config['trading']['stock_symbol'],
+                                    quantity=decision['quantity'],
+                                    current_price=new_data['Close'],
+                                    timestamp=sim_time,
+                                    reason=decision['reasoning']
+                                )
+                            else:
+                                result = st.session_state.executor.execute_market_sell(
+                                    symbol=config['trading']['stock_symbol'],
+                                    quantity=decision['quantity'],
+                                    current_price=new_data['Close'],
+                                    timestamp=sim_time,
+                                    reason=decision['reasoning']
+                                )
+                            if result['success']:
+                                st.session_state.trades_log.append(result['transaction'])
+                                st.session_state.llm_agent.reflect_on_trade(
+                                    trade_result=result,
+                                    portfolio_after=st.session_state.portfolio.get_summary(current_prices)
+                                )
+                        # Performance snapshot
+                        st.session_state.performance.record_snapshot(
+                            timestamp=sim_time,
+                            portfolio_value=portfolio_summary['total_value'],
+                            cash=portfolio_summary['current_cash'],
+                            positions_value=portfolio_summary['positions_value'],
+                            positions=portfolio_summary['current_positions'],
+                            current_prices=current_prices
+                        )
+                        logger.debug(
+                            f"TICK DECISION: action={decision['action']} qty={decision.get('quantity',0)} conf={decision['confidence']:.2f}"
+                        )
+                    except Exception as e:
+                        logger.error(f"Tick decision callback error: {e}")
+                st.session_state.simulator.register_callback(_tick_decision_callback)
+            else:
+                logger.info("DECISION MODE: Interval-based background thread evaluation")
             
             # Initialize portfolio
             logger.info(f"Initializing Portfolio with ₹{config['trading']['initial_capital']}")
@@ -139,12 +243,22 @@ def initialize_components(config):
                 temperature=config['llm']['temperature'],
                 memory_bank=st.session_state.memory_bank,
                 news_tool=st.session_state.news_tool,
-                min_confidence=config['llm']['min_confidence_threshold']
+                min_confidence=config['llm']['min_confidence_threshold'],
+                debug=config['llm'].get('debug', False)
             )
             
             st.session_state.initialized = True
             logger.info("=== INITIALIZATION COMPLETED SUCCESSFULLY ===")
             st.success("✅ All components initialized successfully!")
+
+            # Auto-start simulation + LLM decision thread if auto_start enabled
+            if config.get('simulation', {}).get('auto_start', False) and not st.session_state.simulation_started:
+                logger.info("AUTO-START: Starting simulation immediately after initialization")
+                st.session_state.simulator.start()
+                st.session_state.simulation_started = True
+                st.session_state.last_llm_decision_time = None  # Trigger immediate first decision
+                start_llm_decision_thread()
+                logger.info("AUTO-START: LLM decision thread requested")
             
     except Exception as e:
         logger.error(f"❌ Initialization error: {str(e)}", exc_info=True)
@@ -176,7 +290,8 @@ def render_control_panel():
             logger.info("USER ACTION: Start Simulation button clicked")
             st.session_state.simulator.start()
             st.session_state.simulation_started = True
-            st.session_state.last_llm_decision_time = datetime.now()
+            # Set to None so first decision happens immediately (no initial 30s wait)
+            st.session_state.last_llm_decision_time = None
             logger.info(f"Simulation started at speed {st.session_state.simulator.speed_multiplier}x")
             
             # Start LLM decision thread in continuous mode
@@ -514,7 +629,14 @@ def render_llm_activity():
         
         with col1:
             st.markdown(f"**💭 Reasoning:**")
-            st.info(decision['reasoning'])
+            # Sanitize reasoning to avoid duplicated metric blocks or stray JSON braces
+            raw_reason = decision.get('reasoning', '')
+            cleaned = _clean_reasoning(raw_reason)
+            # Use a scrollable container to prevent layout overflow
+            st.markdown(
+                f"<div style='max-height:220px; overflow-y:auto; padding:8px; background:#1e1e1e; border:1px solid #444; border-radius:6px; font-size:14px;'>{cleaned}</div>",
+                unsafe_allow_html=True
+            )
             
             # Show expected outcome if available
             if decision.get('expected_outcome'):
@@ -533,6 +655,71 @@ def render_llm_activity():
                 st.markdown(f"**✅ Take Profit:** ₹{decision['take_profit']:.2f}")
     else:
         st.info("💤 Waiting for first trading decision...")
+
+    # Debug visibility panel
+    if st.session_state.llm_agent and config['llm'].get('debug', False):
+        with st.expander("🔍 LLM Debug Visibility"):
+            vis = st.session_state.llm_agent.get_visibility()
+            st.markdown("**Model:** " + vis.get('model_name', 'N/A'))
+            st.markdown(f"**Decisions Made:** {vis.get('decision_count', 0)}")
+            st.markdown(f"**Last Decision Time:** {vis.get('last_decision_time', 'None')}")
+            if vis.get('last_error'):
+                st.error(f"Last Error: {vis['last_error']}")
+            if vis.get('last_prompt'):
+                st.markdown("**Last Prompt:**")
+                st.markdown(
+                    f"<div style='max-height:300px; overflow:auto; border:1px solid #444; padding:8px; border-radius:6px; font-size:13px; background:#111;'>{st.session_state.llm_agent.last_prompt.replace('<','&lt;').replace('>','&gt;')}</div>",
+                    unsafe_allow_html=True
+                )
+            if vis.get('last_raw_response'):
+                st.markdown("**Last Raw Response:**")
+                st.markdown(
+                    f"<div style='max-height:300px; overflow:auto; white-space:pre-wrap; border:1px solid #444; padding:8px; border-radius:6px; font-size:13px; background:#111;'>{vis['last_raw_response'].replace('<','&lt;').replace('>','&gt;')}</div>",
+                    unsafe_allow_html=True
+                )
+            # Manual trigger
+            if st.button("⚡ Force Decision Now", key="force_decision_btn"):
+                try:
+                    current_data = st.session_state.simulator.get_current_data()
+                    lookback_data = st.session_state.simulator.get_available_data()
+                    sim_time = st.session_state.simulator.get_current_time() or datetime.now()
+                    current_prices = {config['trading']['stock_symbol']: current_data['Close']}
+                    portfolio_summary = st.session_state.portfolio.get_summary(current_prices)
+                    max_affordable = st.session_state.executor.get_max_affordable_quantity(
+                        config['trading']['stock_symbol'], current_data['Close']
+                    )
+                    decision = st.session_state.llm_agent.make_decision(
+                        market_data=current_data,
+                        portfolio_summary=portfolio_summary,
+                        current_time=sim_time,
+                        max_affordable=max_affordable,
+                        lookback_data=lookback_data
+                    )
+                    st.session_state.last_decision = decision
+                    st.success(f"Forced Decision: {decision['action']} {decision.get('quantity', 0)}")
+                except Exception as e:
+                    st.error(f"Force decision failed: {e}")
+
+def _clean_reasoning(text: str) -> str:
+    """Remove duplicated UI metric lines and trim excessively long internal artifacts."""
+    if not text:
+        return "No reasoning provided"
+    # Remove lines that repeat confidence/ risk already displayed
+    import re
+    lines = text.splitlines()
+    filtered = []
+    skip_patterns = [r'^Confidence\s*$', r'^Risk Level\s*$', r'^Quantity\s*$', r'^MEDIUM$', r'^LOW$', r'^HIGH$']
+    for line in lines:
+        if any(re.match(p, line.strip(), re.IGNORECASE) for p in skip_patterns):
+            continue
+        filtered.append(line)
+    cleaned = '\n'.join(filtered)
+    # Collapse multiple blank lines
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    # Trim if extremely long
+    if len(cleaned) > 3000:
+        cleaned = cleaned[:3000] + "... (truncated)"
+    return cleaned
 
 
 def render_trades_table():
@@ -598,7 +785,9 @@ def render_memory_bank():
                     color = "#fff3cd"
                 
                 with st.expander(f"{icon} Decision #{len(recent)-i+1}: {action} (Confidence: {confidence:.0%})"):
-                    st.markdown(f"**Reasoning:** {reasoning[:200]}...")
+                    cleaned_reason = _clean_reasoning(reasoning)
+                    st.markdown("**Reasoning:**")
+                    st.markdown(f"<div style='max-height:180px; overflow:auto; font-size:13px; background:#1e1e1e; padding:6px; border:1px solid #444; border-radius:4px;'>{cleaned_reason.replace('<','&lt;').replace('>','&gt;')}</div>", unsafe_allow_html=True)
                     if d.get('market_data'):
                         price = d['market_data'].get('price', 0)
                         st.markdown(f"**Price at decision:** ₹{price:.2f}")
@@ -643,20 +832,20 @@ def render_memory_bank():
 
 def llm_decision_loop():
     """Background thread that continuously checks market and makes decisions like a real trader"""
-    logger.info("LLM decision loop started - will check market every 30s after each decision")
+    logger.info("THREAD: LLM decision loop started - continuous autonomous trading engaged")
     
     # Wait for some initial data to accumulate (at least 5 data points)
-    logger.info("⏳ Waiting for initial market data to accumulate...")
+    logger.info("⏳ Waiting for initial market data (min 1 point) before first decision...")
     initial_wait_time = 0
     while st.session_state.get('simulation_started', False):
         available_data = st.session_state.simulator.get_available_data()
-        if len(available_data) >= 5:
-            logger.info(f"✅ Initial data ready: {len(available_data)} points available")
+        if len(available_data) >= config.get('simulation', {}).get('decision_min_data_points', 1):
+            logger.info(f"✅ Initial data ready: {len(available_data)} data points available")
             break
-        time_module.sleep(1)
-        initial_wait_time += 1
-        if initial_wait_time >= 10:
-            logger.warning(f"⚠️ Proceeding with only {len(available_data)} data points after 10s wait")
+        time_module.sleep(0.5)
+        initial_wait_time += 0.5
+        if initial_wait_time >= 5:
+            logger.warning(f"⚠️ Proceeding with only {len(available_data)} data points after 5s wait")
             break
     
     while st.session_state.get('simulation_started', False):
@@ -673,6 +862,11 @@ def llm_decision_loop():
             if st.session_state.last_llm_decision_time:
                 time_since_last = (current_time - st.session_state.last_llm_decision_time).total_seconds()
                 if time_since_last < check_interval:
+                    if int(time_since_last) % 5 == 0:  # heartbeat every 5s
+                        logger.debug(
+                            f"HEARTBEAT: waiting {(check_interval - time_since_last):.1f}s for next decision window; "
+                            f"last_decision at {st.session_state.last_llm_decision_time.strftime('%H:%M:%S')}"
+                        )
                     time_module.sleep(1)
                     continue
                 logger.info(f"⏰ {int(time_since_last)}s elapsed since last check - analyzing market now...")
@@ -777,6 +971,12 @@ def llm_decision_loop():
                 positions=portfolio_summary['current_positions'],
                 current_prices=current_prices
             )
+
+            # Heartbeat after decision
+            logger.debug(
+                f"HEARTBEAT: Decision cycle complete (action={decision['action']}, confidence={decision['confidence']:.2f}); "
+                f"next check in {check_interval}s"
+            )
             
         except Exception as e:
             logger.error(f"Error in LLM decision loop: {str(e)}", exc_info=True)
@@ -787,12 +987,19 @@ def llm_decision_loop():
 def start_llm_decision_thread():
     """Start the background LLM decision thread"""
     if st.session_state.llm_decision_thread is None or not st.session_state.llm_decision_thread.is_alive():
-        st.session_state.llm_decision_thread = threading.Thread(
-            target=llm_decision_loop,
-            daemon=True
-        )
-        st.session_state.llm_decision_thread.start()
-        logger.info("LLM decision thread started")
+        thread = threading.Thread(target=llm_decision_loop, daemon=True, name="llm_decision_loop")
+        # Attach Streamlit ScriptRunContext if available to avoid 'missing ScriptRunContext' warnings
+        if add_script_run_ctx is not None:
+            try:
+                add_script_run_ctx(thread)
+                logger.debug("SCRIPT CONTEXT: Attached ScriptRunContext to LLM decision thread")
+            except Exception as e:
+                logger.warning(f"SCRIPT CONTEXT: Failed to attach context to LLM thread: {e}")
+        else:
+            logger.debug("SCRIPT CONTEXT: add_script_run_ctx not available; proceeding without attaching context")
+        thread.start()
+        st.session_state.llm_decision_thread = thread
+        logger.info("LLM decision thread started (context attached: %s)" % (add_script_run_ctx is not None))
 
 
 def main():
@@ -813,6 +1020,23 @@ def main():
     
     # Initialize session state
     initialize_session_state(config)
+
+    # Auto-initialize and auto-start simulation + LLM if enabled in config (headless autonomy)
+    auto_start = config.get('simulation', {}).get('auto_start', True)
+    if auto_start and not st.session_state.initialized:
+        logger.info("AUTO-START: Initializing components automatically (simulation.auto_start = true)")
+        initialize_components(config)
+    if auto_start and st.session_state.initialized and not st.session_state.simulation_started:
+        logger.info("AUTO-START: Starting simulation automatically")
+        st.session_state.simulator.start()
+        st.session_state.simulation_started = True
+        st.session_state.last_llm_decision_time = None  # Immediate first decision
+        if config.get('simulation', {}).get('continuous_mode', True) and config['llm'].get('decision_mode','interval')=='interval':
+            logger.info("AUTO-START: Launching LLM decision thread")
+            start_llm_decision_thread()
+    # Ensure thread still alive after rerun
+    elif auto_start and st.session_state.simulation_started and config['llm'].get('decision_mode','interval')=='interval':
+        start_llm_decision_thread()
     
     # Render UI
     render_header()
